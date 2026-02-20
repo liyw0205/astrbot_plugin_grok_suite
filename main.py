@@ -41,6 +41,14 @@ class GrokPlugin(Star):
     }
 
     DEFAULT_ASPECT_RATIO = "9:16"
+    DEFAULT_TEXT_IMAGE_SIZE = "1024x1792"
+    SUPPORTED_IMAGE_SIZES = (
+        "1024x1024",
+        "1024x1792",
+        "1280x720",
+        "1792x1024",
+        "720x1280",
+    )
     DEFAULT_SEARCH_MODEL = "grok-4-fast"
     DEFAULT_SEARCH_TIMEOUT = 60.0
     DEFAULT_SEARCH_THINKING_BUDGET = 32000
@@ -145,50 +153,59 @@ class GrokPlugin(Star):
         if not error:
             return "未知错误"
 
-        error_lower = error.lower()
+        raw_error = str(error).strip()
+        if not raw_error:
+            return "未知错误"
+
+        # 已经是中文，直接透传，避免二次翻译后信息丢失
+        if any("\u4e00" <= c <= "\u9fff" for c in raw_error):
+            return raw_error
+
+        error_lower = raw_error.lower()
 
         # 检查是否匹配已知错误模式
         for en_pattern, zh_msg in self.ERROR_TRANSLATIONS.items():
             if en_pattern.lower() in error_lower:
                 return zh_msg
 
+        if "invalid_size" in error_lower or "size must be" in error_lower:
+            return f"尺寸参数不合法: {raw_error}"
+
+        if "invalid_resolution" in error_lower or "resolution_name" in error_lower:
+            return f"视频分辨率参数不合法: {raw_error}"
+
         # 处理 HTTP 状态码
-        if "状态码: 401" in error or "status: 401" in error_lower:
+        if "状态码: 401" in raw_error or "status: 401" in error_lower:
             return "API密钥无效或已过期"
-        if "状态码: 403" in error or "status: 403" in error_lower:
+        if "状态码: 403" in raw_error or "status: 403" in error_lower:
             return "访问被拒绝"
-        if "状态码: 404" in error or "status: 404" in error_lower:
+        if "状态码: 404" in raw_error or "status: 404" in error_lower:
             return "API接口不存在"
-        if "状态码: 429" in error or "status: 429" in error_lower:
+        if "状态码: 429" in raw_error or "status: 429" in error_lower:
             return "请求过于频繁，请稍后重试"
-        if "状态码: 5" in error or "status: 5" in error_lower:
+        if "状态码: 5" in raw_error or "status: 5" in error_lower:
             return "服务器错误，请稍后重试"
 
         # 处理 Errno 错误
         if "errno" in error_lower:
-            if "104" in error:
+            if "104" in raw_error:
                 return "连接被重置，请重试"
-            if "111" in error:
+            if "111" in raw_error:
                 return "连接被拒绝，请检查API地址"
-            if "110" in error:
+            if "110" in raw_error:
                 return "连接超时，请重试"
-            if "113" in error:
+            if "113" in raw_error:
                 return "无法连接到服务器"
 
-        # 如果无法翻译，返回简化的错误
-        # 移除技术细节，只保留关键信息
-        if ":" in error:
-            parts = error.split(":")
-            # 尝试找到有意义的部分
+        # 提取末尾更有价值的片段
+        if ":" in raw_error:
+            parts = raw_error.split(":")
             for part in reversed(parts):
                 part = part.strip()
                 if part and not part.startswith("[") and len(part) > 3:
-                    # 如果还是英文，返回通用错误
-                    if any(c.isalpha() and ord(c) > 127 for c in part):
-                        return part  # 已经是中文
-                    break
+                    return part[:200]
 
-        return "请求失败，请稍后重试"
+        return raw_error[:200]
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         """确保 session 有效（线程安全）"""
@@ -226,6 +243,219 @@ class GrokPlugin(Star):
                     logger.warning(f"Base64 解码失败: {e}")
 
         return results
+
+    @staticmethod
+    def _extract_api_error_message(raw_text: str) -> str:
+        """从 API 错误响应中提取可读信息"""
+        if not raw_text:
+            return ""
+
+        text = raw_text.strip()
+        if not text:
+            return ""
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return text[:500]
+
+        if isinstance(data, dict):
+            error_obj = data.get("error")
+            if isinstance(error_obj, dict):
+                message = str(error_obj.get("message", "")).strip()
+                code = str(error_obj.get("code", "")).strip()
+                param = str(error_obj.get("param", "")).strip()
+                parts = []
+                if message:
+                    parts.append(message)
+                if code and code not in message:
+                    parts.append(f"code={code}")
+                if param and param not in message:
+                    parts.append(f"param={param}")
+                if parts:
+                    return " | ".join(parts)
+            elif isinstance(error_obj, str) and error_obj.strip():
+                return error_obj.strip()
+
+            for key in ("message", "detail", "error_description"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+        return text[:500]
+
+    @staticmethod
+    def _is_size_related_error(error_message: str) -> bool:
+        """判断是否是尺寸参数相关错误"""
+        if not error_message:
+            return False
+        err = error_message.lower()
+        if "invalid_size" in err or "size must be" in err:
+            return True
+        return "size" in err and (
+            "invalid" in err
+            or "unsupported" in err
+            or "unknown" in err
+            or "must be" in err
+        )
+
+    @staticmethod
+    def _is_resolution_related_error(error_message: str) -> bool:
+        """判断是否是视频分辨率参数相关错误"""
+        if not error_message:
+            return False
+        err = error_message.lower()
+        if "invalid_resolution" in err:
+            return True
+        if "resolution_name" in err:
+            return True
+        return "resolution" in err and (
+            "invalid" in err
+            or "unsupported" in err
+            or "must be" in err
+        )
+
+    @staticmethod
+    def _parse_size_string(size: str) -> Optional[Tuple[int, int]]:
+        """解析 WxH 字符串"""
+        if not size or "x" not in size.lower():
+            return None
+        try:
+            width_str, height_str = size.lower().split("x", 1)
+            width = int(width_str.strip())
+            height = int(height_str.strip())
+            if width <= 0 or height <= 0:
+                return None
+            return width, height
+        except (ValueError, AttributeError):
+            return None
+
+    @staticmethod
+    def _format_size(width: int, height: int) -> str:
+        """格式化尺寸字符串"""
+        return f"{width}x{height}"
+
+    def _get_image_resolution(self, image_bytes: bytes) -> Optional[Tuple[int, int]]:
+        """读取图片分辨率"""
+        if not Image:
+            return None
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                width, height = img.size
+            if width <= 0 or height <= 0:
+                return None
+            return width, height
+        except Exception as e:
+            logger.warning(f"读取图片分辨率失败: {e}")
+            return None
+
+    @staticmethod
+    def _ratio_value(aspect_ratio: str) -> Optional[float]:
+        """将比例字符串转换为浮点值"""
+        if not aspect_ratio or ":" not in aspect_ratio:
+            return None
+        try:
+            w_str, h_str = aspect_ratio.split(":", 1)
+            width = float(w_str.strip())
+            height = float(h_str.strip())
+            if width <= 0 or height <= 0:
+                return None
+            return width / height
+        except (ValueError, AttributeError):
+            return None
+
+    def _get_aspect_ratio_from_dimensions(self, width: int, height: int) -> Optional[str]:
+        """从宽高比匹配最接近的支持比例"""
+        if width <= 0 or height <= 0:
+            return None
+
+        ratio = width / height
+        supported_ratios = {
+            "16:9": 16 / 9,
+            "3:2": 3 / 2,
+            "1:1": 1.0,
+            "2:3": 2 / 3,
+            "9:16": 9 / 16,
+        }
+        closest = min(supported_ratios.items(), key=lambda x: abs(x[1] - ratio))
+        return closest[0]
+
+    def _get_aspect_ratio_from_size(self, size: str) -> Optional[str]:
+        """从尺寸字符串推导最接近的比例"""
+        parsed = self._parse_size_string(size)
+        if not parsed:
+            return None
+        width, height = parsed
+        return self._get_aspect_ratio_from_dimensions(width, height)
+
+    def _get_closest_supported_size(self, width: int, height: int) -> Optional[str]:
+        """按分辨率距离匹配最接近的合法尺寸"""
+        if width <= 0 or height <= 0:
+            return None
+
+        candidates: List[Tuple[str, int, int]] = []
+        for size_str in self.SUPPORTED_IMAGE_SIZES:
+            parsed = self._parse_size_string(size_str)
+            if parsed:
+                candidates.append((size_str, parsed[0], parsed[1]))
+
+        if not candidates:
+            return None
+
+        target_ratio = width / height
+        target_area = width * height
+
+        def distance(item: Tuple[str, int, int]) -> Tuple[float, float, float]:
+            _, cand_w, cand_h = item
+            dim_distance = (
+                abs(cand_w - width) / max(width, 1)
+                + abs(cand_h - height) / max(height, 1)
+            )
+            ratio_distance = abs((cand_w / cand_h) - target_ratio)
+            area_distance = abs((cand_w * cand_h) - target_area) / max(target_area, 1)
+            return dim_distance, ratio_distance, area_distance
+
+        best = min(candidates, key=distance)
+        return best[0]
+
+    def _get_size_for_aspect_ratio(self, aspect_ratio: str, prefer_high_resolution: bool = True) -> Optional[str]:
+        """按比例匹配合法尺寸，可优先选择更高分辨率"""
+        target_ratio = self._ratio_value(aspect_ratio)
+        if target_ratio is None:
+            return self.DEFAULT_TEXT_IMAGE_SIZE
+
+        candidates: List[Tuple[str, float, int]] = []
+        for size_str in self.SUPPORTED_IMAGE_SIZES:
+            parsed = self._parse_size_string(size_str)
+            if not parsed:
+                continue
+            width, height = parsed
+            ratio_distance = abs((width / height) - target_ratio)
+            area = width * height
+            candidates.append((size_str, ratio_distance, area))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[1])
+        if not prefer_high_resolution:
+            best_ratio_distance = candidates[0][1]
+            best_candidates = [c for c in candidates if abs(c[1] - best_ratio_distance) < 1e-9]
+            return max(best_candidates, key=lambda x: x[2])[0]
+
+        best_ratio_distance = candidates[0][1]
+        ratio_window = best_ratio_distance + 0.03
+        high_res_candidates = [c for c in candidates if c[1] <= ratio_window]
+        return max(high_res_candidates, key=lambda x: x[2])[0]
+
+    def _get_video_resolution_name(self, size: Optional[str]) -> str:
+        """根据目标尺寸推导视频分辨率档位"""
+        parsed = self._parse_size_string(size or "")
+        if parsed:
+            width, height = parsed
+            if max(width, height) >= 1700:
+                return "1080p"
+        return "720p"
 
     # ==================== API 调用 ====================
 
@@ -269,15 +499,21 @@ class GrokPlugin(Star):
                 url = url[:-len(suffix)]
         return url.rstrip("/")
 
-    async def _generate_image(self, prompt: str, image_bytes: Optional[bytes] = None,
-                               n: int = 1, aspect_ratio: str = "1:1") -> Tuple[List[Tuple[Optional[str], Optional[bytes]]], Optional[str]]:
+    async def _generate_image(
+        self,
+        prompt: str,
+        image_bytes: Optional[bytes] = None,
+        n: int = 1,
+        aspect_ratio: str = "1:1",
+        target_size: Optional[str] = None,
+    ) -> Tuple[List[Tuple[Optional[str], Optional[bytes]]], Optional[str]]:
         """调用 Grok 生图 API，返回 [(url_or_path, bytes), ...] 或错误
 
         文生图: POST /v1/images/generations (JSON)
         图生图: POST /v1/images/edits (multipart/form-data)
         """
         if image_bytes:
-            return await self._edit_image(prompt, image_bytes, n, aspect_ratio)
+            return await self._edit_image(prompt, image_bytes, n, aspect_ratio, target_size=target_size)
 
         base_url = self._get_base_url()
         api_url = f"{base_url}/v1/images/generations"
@@ -290,13 +526,12 @@ class GrokPlugin(Star):
             "response_format": "url"
         }
 
-        # 尺寸映射到比例
-        size_map = {
-            "16:9": "1024x576", "9:16": "576x1024", "1:1": "1024x1024",
-            "2:3": "1024x1536", "3:2": "1536x1024"
-        }
-        if aspect_ratio and aspect_ratio in size_map:
-            payload["size"] = size_map[aspect_ratio]
+        resolved_size = target_size or self._get_size_for_aspect_ratio(
+            aspect_ratio,
+            prefer_high_resolution=True,
+        )
+        if resolved_size:
+            payload["size"] = resolved_size
 
         try:
             session = await self._ensure_session()
@@ -309,7 +544,8 @@ class GrokPlugin(Star):
                 if resp.status != 200:
                     text = await resp.text()
                     logger.error(f"[文生图] API 请求失败 (状态码: {resp.status}): {text[:200]}")
-                    return [], self._translate_error(f"状态码: {resp.status}")
+                    detail = self._extract_api_error_message(text)
+                    return [], self._translate_error(detail or f"状态码: {resp.status}")
 
                 raw_content = await resp.read()
                 try:
@@ -329,8 +565,43 @@ class GrokPlugin(Star):
             logger.error(f"[文生图] 请求异常: {e}")
             return [], self._translate_error(str(e))
 
-    async def _edit_image(self, prompt: str, image_bytes: bytes,
-                          n: int = 1, aspect_ratio: str = "1:1") -> Tuple[List[Tuple[Optional[str], Optional[bytes]]], Optional[str]]:
+    def _build_edit_image_form(
+        self,
+        model: str,
+        prompt: str,
+        n: int,
+        image_bytes: bytes,
+        size: Optional[str] = None,
+    ) -> aiohttp.FormData:
+        """构建图生图请求体"""
+        form = aiohttp.FormData()
+        form.add_field("model", model)
+        form.add_field("prompt", prompt)
+        form.add_field("n", str(max(1, min(n, self.MAX_IMAGE_COUNT))))
+        form.add_field("response_format", "url")
+        if size:
+            form.add_field("size", size)
+
+        mime_type = self._detect_mime_type(image_bytes)
+        ext = mime_type.split("/")[-1]
+        if ext == "jpeg":
+            ext = "jpg"
+        form.add_field(
+            "image",
+            image_bytes,
+            filename=f"image.{ext}",
+            content_type=mime_type,
+        )
+        return form
+
+    async def _edit_image(
+        self,
+        prompt: str,
+        image_bytes: bytes,
+        n: int = 1,
+        aspect_ratio: str = "1:1",
+        target_size: Optional[str] = None,
+    ) -> Tuple[List[Tuple[Optional[str], Optional[bytes]]], Optional[str]]:
         """调用 Grok 图片编辑 API (图生图)
 
         使用 /v1/images/edits 接口，multipart/form-data 格式
@@ -338,56 +609,71 @@ class GrokPlugin(Star):
         base_url = self._get_base_url()
         api_url = f"{base_url}/v1/images/edits"
         model = self.conf.get("grok_edit_model", "grok-imagine-1.0-edit")
+        resolved_size = target_size
+        if not resolved_size:
+            source_resolution = self._get_image_resolution(image_bytes)
+            if source_resolution:
+                resolved_size = self._get_closest_supported_size(*source_resolution)
+            if not resolved_size:
+                resolved_size = self._get_size_for_aspect_ratio(aspect_ratio, prefer_high_resolution=True)
 
-        # 构建 multipart/form-data
-        form = aiohttp.FormData()
-        form.add_field('model', model)
-        form.add_field('prompt', prompt)
-        form.add_field('n', str(max(1, min(n, self.MAX_IMAGE_COUNT))))
-        form.add_field('response_format', 'url')
+        size_attempts: List[Optional[str]] = [resolved_size] if resolved_size else [None]
+        if resolved_size:
+            size_attempts.append(None)
 
-        # 添加图片文件
-        mime_type = self._detect_mime_type(image_bytes)
-        ext = mime_type.split('/')[-1]
-        if ext == 'jpeg':
-            ext = 'jpg'
-        form.add_field('image', image_bytes,
-                       filename=f'image.{ext}',
-                       content_type=mime_type)
+        last_error = None
+        for current_size in size_attempts:
+            form = self._build_edit_image_form(model, prompt, n, image_bytes, size=current_size)
+            try:
+                session = await self._ensure_session()
+                headers = {"Authorization": f"Bearer {self.conf.get('grok_api_key', '')}"}
+                async with session.post(
+                    api_url,
+                    headers=headers,
+                    data=form,
+                    timeout=aiohttp.ClientTimeout(total=self.IMAGE_TIMEOUT)
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"[图生图] API 请求失败 (状态码: {resp.status}): {text[:200]}")
+                        detail = self._extract_api_error_message(text)
+                        translated_error = self._translate_error(detail or f"状态码: {resp.status}")
+                        last_error = translated_error
 
-        try:
-            session = await self._ensure_session()
-            headers = {"Authorization": f"Bearer {self.conf.get('grok_api_key', '')}"}
-            async with session.post(
-                api_url,
-                headers=headers,
-                data=form,
-                timeout=aiohttp.ClientTimeout(total=self.IMAGE_TIMEOUT)
-            ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(f"[图生图] API 请求失败 (状态码: {resp.status}): {text[:200]}")
-                    return [], self._translate_error(f"状态码: {resp.status}")
+                        if current_size and self._is_size_related_error(detail):
+                            logger.warning(
+                                f"[图生图] size={current_size} 失败，尝试降级为后端默认尺寸: {detail[:120]}"
+                            )
+                            continue
+                        return [], translated_error
 
-                raw_content = await resp.read()
-                try:
-                    data = json.loads(raw_content.decode('utf-8'))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    logger.error(f"JSON解析失败，响应前200字节: {raw_content[:200]}")
-                    return [], "API响应格式异常"
+                    raw_content = await resp.read()
+                    try:
+                        data = json.loads(raw_content.decode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        logger.error(f"JSON解析失败，响应前200字节: {raw_content[:200]}")
+                        return [], "API响应格式异常"
 
-                results = self._parse_image_api_response(data)
-                if results:
-                    return results, None
-                return [], "未能从响应中提取图片"
+                    results = self._parse_image_api_response(data)
+                    if results:
+                        return results, None
+                    return [], "未能从响应中提取图片"
 
-        except asyncio.TimeoutError:
-            return [], "请求超时，请重试"
-        except Exception as e:
-            logger.error(f"[图生图] 请求异常: {e}")
-            return [], self._translate_error(str(e))
+            except asyncio.TimeoutError:
+                return [], "请求超时，请重试"
+            except Exception as e:
+                logger.error(f"[图生图] 请求异常: {e}")
+                return [], self._translate_error(str(e))
 
-    async def _generate_video(self, prompt: str, image_bytes: bytes, aspect_ratio: str = "16:9") -> Tuple[Optional[str], Optional[str]]:
+        return [], last_error or "图生图请求失败"
+
+    async def _generate_video(
+        self,
+        prompt: str,
+        image_bytes: bytes,
+        aspect_ratio: str = "16:9",
+        resolution_name: str = "720p",
+    ) -> Tuple[Optional[str], Optional[str]]:
         """调用 Grok 生视频 API
 
         使用 /v1/chat/completions 接口，模型为 grok-imagine-1.0-video
@@ -406,61 +692,93 @@ class GrokPlugin(Star):
             ]
         }]
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": True,
-            "video_config": {
-                "aspect_ratio": aspect_ratio,
-                "resolution_name": "720p"
+        resolution_candidates = [resolution_name or "720p"]
+        if resolution_candidates[0] != "720p":
+            resolution_candidates.append("720p")
+
+        last_error: Optional[str] = None
+        for current_resolution in resolution_candidates:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "video_config": {
+                    "aspect_ratio": aspect_ratio,
+                    "resolution_name": current_resolution,
+                },
             }
-        }
 
-        for attempt in range(3):
-            try:
-                session = await self._ensure_session()
-                async with session.post(
-                    api_url,
-                    headers=self._get_headers(),
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=self.VIDEO_TIMEOUT)
-                ) as resp:
-                    if resp.status != 200:
-                        if resp.status >= 500 and attempt < 2:
-                            await asyncio.sleep(2)
-                            continue
-                        text = await resp.text()
-                        logger.error(f"[图生视频] API 请求失败 (状态码: {resp.status}): {text[:200]}")
-                        return None, self._translate_error(f"状态码: {resp.status}")
+            need_fallback_resolution = False
+            for attempt in range(3):
+                try:
+                    session = await self._ensure_session()
+                    async with session.post(
+                        api_url,
+                        headers=self._get_headers(),
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=self.VIDEO_TIMEOUT)
+                    ) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            logger.error(f"[图生视频] API 请求失败 (状态码: {resp.status}): {text[:200]}")
+                            detail = self._extract_api_error_message(text)
+                            translated_error = self._translate_error(detail or f"状态码: {resp.status}")
+                            last_error = translated_error
 
-                    media_bytes, media_url, error = await self._parse_media_response(resp, "video")
-                    if error:
-                        if attempt < 2:
-                            await asyncio.sleep(2)
-                            continue
-                        return None, error
-                    if media_bytes:
-                        # 返回 bytes 需要先保存为临时文件
-                        filename = f"grok_video_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp4"
-                        file_path = self.temp_dir / filename
-                        async with aiofiles.open(file_path, 'wb') as f:
-                            await f.write(media_bytes)
-                        return str(file_path), None
-                    if media_url:
-                        return media_url, None
-                    return None, "API 响应中未包含有效视频内容"
+                            if resp.status >= 500 and attempt < 2:
+                                await asyncio.sleep(2)
+                                continue
 
-            except (asyncio.TimeoutError, aiohttp.ClientError):
-                if attempt == 2:
-                    return None, "请求超时，请重试"
-                await asyncio.sleep(2)
-            except Exception as e:
-                if attempt == 2:
-                    logger.error(f"[图生视频] 请求异常: {e}")
-                    return None, self._translate_error(str(e))
-                await asyncio.sleep(1)
+                            if (
+                                current_resolution != "720p"
+                                and (
+                                    self._is_resolution_related_error(detail)
+                                    or resp.status == 400
+                                )
+                            ):
+                                logger.warning(
+                                    f"[图生视频] resolution_name={current_resolution} 不可用，回退到 720p: {detail[:120]}"
+                                )
+                                need_fallback_resolution = True
+                                break
 
-        return None, "所有重试均失败"
+                            return None, translated_error
+
+                        media_bytes, media_url, error = await self._parse_media_response(resp, "video")
+                        if error:
+                            if attempt < 2:
+                                await asyncio.sleep(2)
+                                continue
+                            return None, error
+                        if media_bytes:
+                            # 返回 bytes 需要先保存为临时文件
+                            filename = f"grok_video_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp4"
+                            file_path = self.temp_dir / filename
+                            async with aiofiles.open(file_path, "wb") as f:
+                                await f.write(media_bytes)
+                            return str(file_path), None
+                        if media_url:
+                            return media_url, None
+                        return None, "API 响应中未包含有效视频内容"
+
+                except (asyncio.TimeoutError, aiohttp.ClientError):
+                    if attempt == 2:
+                        last_error = "请求超时，请重试"
+                    else:
+                        await asyncio.sleep(2)
+                except Exception as e:
+                    if attempt == 2:
+                        logger.error(f"[图生视频] 请求异常: {e}")
+                        last_error = self._translate_error(str(e))
+                    else:
+                        await asyncio.sleep(1)
+
+            if need_fallback_resolution:
+                continue
+            if last_error:
+                return None, last_error
+
+        return None, last_error or "所有重试均失败"
 
     # ==================== 响应解析 ====================
 
@@ -1349,31 +1667,10 @@ class GrokPlugin(Star):
 
     def _get_aspect_ratio_from_image(self, image_bytes: bytes) -> Optional[str]:
         """从图片字节识别宽高比，返回最接近的支持比例"""
-        if not Image:
+        resolution = self._get_image_resolution(image_bytes)
+        if not resolution:
             return None
-        try:
-            with Image.open(io.BytesIO(image_bytes)) as img:
-                width, height = img.size
-                if width <= 0 or height <= 0:
-                    return None
-
-                ratio = width / height
-
-                # 支持的比例及其数值
-                supported_ratios = {
-                    "16:9": 16 / 9,   # 1.778
-                    "3:2": 3 / 2,     # 1.5
-                    "1:1": 1.0,       # 1.0
-                    "2:3": 2 / 3,     # 0.667
-                    "9:16": 9 / 16,   # 0.5625
-                }
-
-                # 找到最接近的比例
-                closest = min(supported_ratios.items(), key=lambda x: abs(x[1] - ratio))
-                return closest[0]
-        except Exception as e:
-            logger.warning(f"自动识别图片比例失败: {e}")
-            return None
+        return self._get_aspect_ratio_from_dimensions(*resolution)
 
     def _parse_image_params(self, text: str) -> Tuple[str, Dict[str, Any]]:
         """解析生图参数: [数量] [比例] 提示词（顺序任意）
@@ -1385,7 +1682,7 @@ class GrokPlugin(Star):
         - 遇到非参数词立即停止，后续全部作为提示词
         - 每种参数最多识别一次
         """
-        params = {"n": 1, "aspect_ratio": self.DEFAULT_ASPECT_RATIO}
+        params = {"n": 1, "aspect_ratio": self.DEFAULT_ASPECT_RATIO, "aspect_ratio_specified": False}
         parts = text.split()
         if not parts:
             return "", params
@@ -1406,6 +1703,7 @@ class GrokPlugin(Star):
             # 检查是否为比例
             elif not found_ratio and p in self.ASPECT_RATIOS:
                 params["aspect_ratio"] = self.ASPECT_RATIOS[p]
+                params["aspect_ratio_specified"] = True
                 prompt_start = i + 1
                 found_ratio = True
             else:
@@ -1456,10 +1754,39 @@ class GrokPlugin(Star):
 
         n = params["n"]
         ratio = params["aspect_ratio"]
-        yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {ratio} ...")
+        ratio_specified = bool(params.get("aspect_ratio_specified", False))
+
+        source_resolution = None
+        target_size = None
+        if image_bytes:
+            source_resolution = self._get_image_resolution(image_bytes)
+            if source_resolution:
+                target_size = self._get_closest_supported_size(*source_resolution)
+            if not target_size:
+                target_size = self._get_size_for_aspect_ratio(ratio, prefer_high_resolution=True)
+            if target_size:
+                ratio = self._get_aspect_ratio_from_size(target_size) or ratio
+        else:
+            if ratio_specified:
+                target_size = self._get_size_for_aspect_ratio(ratio, prefer_high_resolution=True)
+            else:
+                target_size = self.DEFAULT_TEXT_IMAGE_SIZE
+                ratio = self._get_aspect_ratio_from_size(target_size) or ratio
+
+        if not target_size:
+            target_size = self.DEFAULT_TEXT_IMAGE_SIZE
+            ratio = self._get_aspect_ratio_from_size(target_size) or ratio
+
+        if source_resolution:
+            source_size_str = self._format_size(source_resolution[0], source_resolution[1])
+            yield event.plain_result(
+                f"🎨 正在进行 [{mode}] · {n}张 · {ratio} · {source_size_str}→{target_size} ..."
+            )
+        else:
+            yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {ratio} · {target_size} ...")
 
         results, error = await self._generate_image(
-            prompt_text, image_bytes, n=n, aspect_ratio=ratio
+            prompt_text, image_bytes, n=n, aspect_ratio=ratio, target_size=target_size
         )
 
         if error:
@@ -1532,12 +1859,31 @@ class GrokPlugin(Star):
             yield event.plain_result("❌ 需要图片，请上传或引用图片")
             return
 
-        # 自动识别图片方向
-        aspect_ratio = self._get_aspect_ratio_from_image(image_bytes) or self.DEFAULT_ASPECT_RATIO
+        source_resolution = self._get_image_resolution(image_bytes)
+        target_size = None
+        if source_resolution:
+            target_size = self._get_closest_supported_size(*source_resolution)
+        if not target_size:
+            target_size = self._get_size_for_aspect_ratio(self.DEFAULT_ASPECT_RATIO, prefer_high_resolution=True)
+        if not target_size:
+            target_size = self.DEFAULT_TEXT_IMAGE_SIZE
 
-        yield event.plain_result(f"🎬 正在进行 [图生视频] · {aspect_ratio} ...")
+        aspect_ratio = self._get_aspect_ratio_from_size(target_size) or self.DEFAULT_ASPECT_RATIO
+        resolution_name = self._get_video_resolution_name(target_size)
 
-        video_result, error = await self._generate_video(prompt_text, image_bytes, aspect_ratio)
+        if source_resolution:
+            source_size_str = self._format_size(source_resolution[0], source_resolution[1])
+            yield event.plain_result(
+                f"🎬 正在进行 [图生视频] · {source_size_str}→{target_size} · {aspect_ratio} · {resolution_name} ..."
+            )
+        else:
+            yield event.plain_result(
+                f"🎬 正在进行 [图生视频] · {target_size} · {aspect_ratio} · {resolution_name} ..."
+            )
+
+        video_result, error = await self._generate_video(
+            prompt_text, image_bytes, aspect_ratio, resolution_name
+        )
 
         if error:
             yield event.plain_result(f"❌ [图生视频] 生成失败: {self._translate_error(error)}")
@@ -1592,6 +1938,7 @@ class GrokPlugin(Star):
             "/grok生图 [数量] [比例] 提示词\n"
             "• 数量: 1-10 (默认1)\n"
             "• 比例: 横/竖/方/16:9/9:16/1:1/3:2/2:3 (默认竖)\n"
+            "• 3:2/2:3 会自动映射到最近合法尺寸\n"
             "• 可附带图片进行图生图\n\n"
             "示例:\n"
             "• /grok生图 一只猫\n"
@@ -1600,8 +1947,8 @@ class GrokPlugin(Star):
             "━━━━━━━━━━━━━━\n"
             "🎬 视频命令:\n"
             "/grok视频 提示词 + 图片\n"
-            "• 自动识别图片方向\n"
-            "• 分辨率: 720p\n\n"
+            "• 自动读取原图分辨率并匹配最近合法尺寸\n"
+            "• 分辨率档位自动选择，必要时回落到 720p\n\n"
             "示例:\n"
             "• /grok视频 让画面动起来\n"
             "• /grok视频 让人物眨眼微笑\n\n"
