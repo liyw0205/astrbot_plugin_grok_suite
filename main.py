@@ -675,7 +675,9 @@ class GrokPlugin(Star):
                 payload["response_format"] = response_format
             if resolved_size:
                 payload["size"] = resolved_size
+                logger.info(f"[文生图] 发送尺寸参数: {resolved_size}")
 
+            logger.info(f"[文生图] 完整请求参数: {payload}")
             for attempt in range(self.MAX_REQUEST_RETRIES):
                 try:
                     session = await self._ensure_session()
@@ -944,13 +946,13 @@ class GrokPlugin(Star):
         # 优先尝试增强参数；若后端不支持 preset，再自动降级到基础参数
         video_config_candidates: List[Dict[str, Any]] = [
             {
-                "aspect_ratio": target_size,
+                "size": target_size,
                 "resolution_name": self.VIDEO_RESOLUTION_NAME,
                 "video_length": video_length,
                 "preset": "custom",
             },
             {
-                "aspect_ratio": target_size,
+                "size": target_size,
                 "resolution_name": self.VIDEO_RESOLUTION_NAME,
                 "video_length": video_length,
             },
@@ -958,12 +960,14 @@ class GrokPlugin(Star):
 
         last_error: Optional[str] = None
         for config_index, current_video_config in enumerate(video_config_candidates):
+            logger.info(f"[生视频] 尝试配置 {config_index + 1}: {current_video_config}")
             payload = {
                 "model": model,
                 "messages": messages,
                 "stream": True,
                 "video_config": current_video_config,
             }
+            logger.info(f"[生视频] 完整请求参数: {payload}")
 
             need_fallback_config = False
             for attempt in range(self.MAX_REQUEST_RETRIES):
