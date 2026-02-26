@@ -101,29 +101,42 @@ class GrokPlugin(Star):
 
     @staticmethod
     def _strip_markdown(text: str) -> str:
-        """移除文本中的 Markdown 格式"""
+        """移除文本中的 Markdown 格式，但保留排版结构（换行、段落、列表）"""
         if not text:
             return ""
-        # 移除代码块（包括语言标识符）
+
+        # 移除代码块标记，但保留内容和内部换行
         text = re.sub(r'```(?:\w+)?\n?([\s\S]*?)```', r'\1', text)
-        # 移除行内代码
+
+        # 移除行内代码标记
         text = re.sub(r'`([^`]+)`', r'\1', text)
-        # 移除粗体
+
+        # 移除粗体标记
         text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
         text = re.sub(r'__([^_]+)__', r'\1', text)
-        # 移除斜体
+
+        # 移除斜体标记
         text = re.sub(r'\*([^*]+)\*', r'\1', text)
         text = re.sub(r'_([^_]+)_', r'\1', text)
-        # 移除标题符号
+
+        # 移除标题符号，保留标题文本和换行
         text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-        # 移除链接，保留文本
-        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-        # 移除图片
+
+        # 转换链接格式：[文本](url) → 文本: url
+        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1: \2', text)
+
+        # 移除图片标记，保留 alt 文本
         text = re.sub(r'!\[([^\]]*)\]\([^)]+\)', r'\1', text)
-        # 移除水平线
-        text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
-        # 移除引用符号
+
+        # 移除水平线（整行删除）
+        text = re.sub(r'^[-*_]{3,}\s*$\n?', '', text, flags=re.MULTILINE)
+
+        # 移除引用符号，保留引用内容
         text = re.sub(r'^>\s+', '', text, flags=re.MULTILINE)
+
+        # 移除多余的连续空行（保留最多一个空行）
+        text = re.sub(r'\n{3,}', '\n\n', text)
+
         return text.strip()
 
     ERROR_TRANSLATIONS = {
