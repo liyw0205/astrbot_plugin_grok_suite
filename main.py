@@ -17,6 +17,15 @@ except ImportError:
 
 import aiohttp
 import aiofiles
+from .prompt_styles import (
+    HAND_FIGURE_GROUP,
+    REALISTIC_SELFIE_GROUP,
+    COSPLAY_GROUP,
+    ATMOSPHERE_GROUP,
+    CONCEPT_BREAKDOWN_PROMPT,
+    NINE_GRID_PROMPT,
+    SAFE_PREFIX
+)
 from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, StarTools
@@ -78,6 +87,14 @@ class GrokPlugin(Star):
         self.temp_dir.mkdir(exist_ok=True, parents=True)
         self.image_dir.mkdir(exist_ok=True, parents=True)
         self.video_dir.mkdir(exist_ok=True, parents=True)
+        self.is_sensitive = self.conf.get("is_sensitive", True)
+        self.sensitive_keywords = [
+            kw.lower().strip()
+            for kw in self.conf.get("sensitive_keywords", [])
+            if kw and isinstance(kw, str)
+        ]
+        self._last_usage: Dict[str, float] = {}
+        self.rate_limit_seconds = self.conf.get("rate_limit_seconds", 60)
 
     async def initialize(self):
         if Image is None:
@@ -651,12 +668,17 @@ class GrokPlugin(Star):
         mask_bytes: Optional[bytes] = None,
         n: int = 1,
         target_size: Optional[str] = None,
+        is_whitelisted: Optional[str] = False,
     ) -> Tuple[List[Tuple[Optional[str], Optional[bytes]]], Optional[str]]:
         """调用 Grok 生图 API，返回 [(url_or_path, bytes), ...] 或错误
 
         文生图: POST /v1/images/generations (JSON)
         图生图: POST /v1/images/edits (multipart/form-data)
         """
+        if is_whitelisted:
+            logger.info("过滤白名单用户，取消增加翻译提示词")
+        else:
+            prompt = SAFE_PREFIX + prompt
         if image_bytes:
             return await self._edit_image(
                 prompt,
@@ -2100,6 +2122,30 @@ class GrokPlugin(Star):
 
         return True, None
 
+    async def _check_rate_limit(self, event: AstrMessageEvent) -> Tuple[bool, Optional[str]]:
+        """返回 (是否允许执行, 拒绝时的提示语)"""
+        rate_seconds = self.rate_limit_seconds
+        if rate_seconds <= 0:
+            return True, None  # 关闭了限制
+
+        sender_id = str(event.get_sender_id())
+    
+        # 白名单直接放行
+        whitelist = self.conf.get("rate_limit_whitelist", [])
+        if sender_id in [str(uid) for uid in whitelist]:
+            return True, None
+
+        last_time = self._last_usage.get(sender_id, 0)
+        now = time.time()
+        remain = rate_seconds - (now - last_time)
+
+        if remain > 0:
+            return False, f"⏳ 技能冷却中，还剩 {int(remain)+1} 秒（每{rate_seconds}秒限一次）"
+
+        # 通过检查，更新时间
+        self._last_usage[sender_id] = now
+        return True, None
+    
     # ==================== 参数解析 ====================
 
     def _parse_image_params(self, text: str, strict_size: bool = True) -> Tuple[str, Dict[str, Any]]:
@@ -2207,7 +2253,7 @@ class GrokPlugin(Star):
 
     # ==================== 命令 ====================
 
-    @filter.command("grok生图", prefix_optional=True)
+    @filter.command("grok生图", alias={"Grok生图", "grok 生图", "Grok 生图"}, prefix_optional=True)
     async def on_image_request(self, event: AstrMessageEvent):
         """Grok 生图: /grok生图 [数量] [尺寸] <提示词> [+图片可选]"""
         api_key = self.conf.get("grok_api_key", "").strip()
@@ -2230,6 +2276,11 @@ class GrokPlugin(Star):
         can_proceed, _ = await self._check_permissions(event)
         if not can_proceed:
             yield event.plain_result("❌ 当前会话无权限使用此功能")
+            return
+
+        allowed, msg = await self._check_rate_limit(event)
+        if not allowed:
+            yield event.plain_result(msg)
             return
 
         image_inputs = await self._get_images_from_event(event, max_count=2)
@@ -2271,15 +2322,48 @@ class GrokPlugin(Star):
 
         yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {target_size} ...")
 
+        if prompt_text:
+            translate_prompt = (
+                "请把下面这段中文描述直接翻译成非常适合AI图像生成的英文提示词，"
+                "要详细、艺术化、结构清晰，包含主体、场景、风格、光影、细节等描述，"
+                "不要添加任何多余的解释，直接输出英文：\n\n" + prompt_text
+            )
+    
+            translate_result = await self._perform_web_search(translate_prompt)
+            if translate_result.get("ok"):
+                english_prompt = translate_result["content"].strip()
+                english_prompt = english_prompt.strip('"').strip("'").replace('\n', ' ').strip()
+                if len(english_prompt) > 20:  # 防止翻译崩了
+                    logger.info(f"原提示: {prompt_text[:60]}...")
+                    logger.info(f"翻译后: {english_prompt[:80]}...")
+                    prompt_text = english_prompt
+                else:
+                    logger.warning("翻译结果过短，保留原中文提示")
+            else:
+                logger.warning("翻译请求失败，保留原中文提示")
+
+        is_sensitive = False
+        sensitive_text = None
+        sender_id = event.get_sender_id()
+        is_whitelisted = False
+        user_whitelist = self.conf.get("sensitive_whitelist", [])
+        if sender_id and user_whitelist:
+            if str(sender_id) in [str(uid) for uid in user_whitelist]:
+                is_whitelisted = True
+
         results, error = await self._generate_image(
             prompt_text,
             image_bytes,
             mask_bytes=mask_bytes,
             n=n,
             target_size=target_size,
+            is_whitelisted=is_whitelisted
         )
 
         if error:
+            sender_id = str(event.get_sender_id())
+            if sender_id in self._last_usage:
+                self._last_usage[sender_id] = 10
             yield event.plain_result(f"❌ [{mode}] 生成失败: {self._translate_error(error)}")
             return
 
@@ -2287,9 +2371,19 @@ class GrokPlugin(Star):
             yield event.plain_result("❌ 未获取到图片")
             return
 
-        # 处理所有图片（URL 需下载，bytes 直接使用）
+        if not is_whitelisted and self.sensitive_keywords and self.is_sensitive:  # 如果配置了关键词才进行过滤
+            prompt_clean = re.sub(r'\s+|[,.，。!！?？-]', '', prompt_text.lower())
+    
+            for kw in self.sensitive_keywords:
+                if kw in prompt_clean:
+                    is_sensitive = True
+                    sensitive_text = kw
+                    logger.info(f"[敏感词过滤] 命中关键词: {kw}")
+                    break
+
         images_data = []
         failed_count = 0
+
         for i, (url_or_path, img_bytes) in enumerate(results):
             if img_bytes:
                 images_data.append((url_or_path or f"image_{i}", img_bytes))
@@ -2304,18 +2398,28 @@ class GrokPlugin(Star):
             yield event.plain_result("❌ 图片下载失败，请到后台查看")
             return
 
-        # 单张图片直接发送，多张使用合并转发
-        if len(images_data) == 1:
-            async for result in self._save_and_send_media(event, images_data[0][0], images_data[0][1], "image"):
-                yield result
-            # 单张图片时，如果有失败的，单独提示
-            if failed_count > 0:
-                yield event.plain_result(f"⚠️ {failed_count}张图片下载失败，请到后台查看")
+        if is_sensitive:
+            # 只发链接 + 警告
+            yield event.plain_result(f"⚠️ 检测到可能敏感内容“{sensitive_text}”，为保护账号，仅提供链接")
+            lines = []
+            for idx, (orig_url, _) in enumerate(images_data, 1):
+                display_url = orig_url if orig_url.startswith("http") else "(本地生成，无法直链)"
+                lines.append(f"{display_url}\n")
+            if failed_count:
+                lines.append(f"\n⚠️ 其中 {failed_count} 张下载失败")
+            yield event.plain_result("\n".join(lines))
         else:
-            async for result in self._send_images_forward(event, images_data, failed_count):
-                yield result
+            # 正常发送图片
+            if len(images_data) == 1:
+                async for result in self._save_and_send_media(event, images_data[0][0], images_data[0][1], "image"):
+                    yield result
+                if failed_count > 0:
+                    yield event.plain_result(f"⚠️ {failed_count}张图片下载失败，请到后台查看")
+            else:
+                async for result in self._send_images_forward(event, images_data, failed_count):
+                    yield result
 
-    @filter.command("grok视频", prefix_optional=True)
+    @filter.command("grok视频", alias={"Grok视频", "grok 视频", "Grok 视频"}, prefix_optional=True)
     async def on_video_request(self, event: AstrMessageEvent):
         """Grok 生视频: /grok视频 [尺寸] [时长] <提示词> [+图片可选]"""
         api_key = self.conf.get("grok_api_key", "").strip()
@@ -2340,6 +2444,11 @@ class GrokPlugin(Star):
             yield event.plain_result("❌ 当前会话无权限使用此功能")
             return
 
+        allowed, msg = await self._check_rate_limit(event)
+        if not allowed:
+            yield event.plain_result(msg)
+            return
+        
         image_bytes = await self._get_image_from_event(event)
         mode = "图生视频" if image_bytes else "文生视频"
         prompt_text, params = self._parse_video_params(user_input, strict_size=not image_bytes)
@@ -2382,6 +2491,9 @@ class GrokPlugin(Star):
         )
 
         if error:
+            sender_id = str(event.get_sender_id())
+            if sender_id in self._last_usage:
+                self._last_usage[sender_id] = 10
             yield event.plain_result(f"❌ [{mode}] 生成失败: {self._translate_error(error)}")
             return
 
@@ -2426,7 +2538,368 @@ class GrokPlugin(Star):
             else:
                 yield event.plain_result("❌ 视频下载失败，请到后台查看")
 
-    @filter.command("grok帮助", prefix_optional=True)
+    @filter.command("grok手办化", alias={"Grok手办化", "grok 手办化", "Grok 手办化"}, prefix_optional=True)
+    async def on_figure(self, event: AstrMessageEvent):
+        api_key = self.conf.get("grok_api_key", "").strip()
+        if not api_key:
+            yield event.plain_result("❌ 未配置 API 密钥")
+            return
+
+        raw_input = event.message_str.strip()
+        cmd = "grok手办化"
+        user_input = raw_input[len(cmd):].strip() if raw_input.lower().startswith(cmd) else raw_input
+
+        image_bytes = await self._get_image_from_event(event)
+        if not image_bytes:
+            yield event.plain_result("❌ 请附带一张清晰的参考图")
+            return
+
+        can_proceed, _ = await self._check_permissions(event)
+        if not can_proceed:
+            yield event.plain_result("❌ 当前会话无权限使用手办化功能")
+            return
+
+        allowed, msg = await self._check_rate_limit(event)
+        if not allowed:
+            yield event.plain_result(msg)
+            return
+
+        style_idx = None
+        if user_input and user_input.split()[0].isdigit():
+            try:
+                style_idx = int(user_input.split()[0])
+            except:
+                pass
+
+        style, is_random = HAND_FIGURE_GROUP.select(style_idx)
+
+        yield event.plain_result(style.loading_text(is_random))
+
+        results, error = await self._generate_image(
+            prompt=style.prompt,
+            image_bytes=image_bytes,
+            n=1,
+            target_size="1024x1792",  # 手办化建議用豎圖
+        )
+
+        if error:
+            sender_id = str(event.get_sender_id())
+            if sender_id in self._last_usage:
+                self._last_usage[sender_id] = 10
+            err_msg = self._translate_error(error)
+            if "content policy" in err_msg.lower() or "safety" in err_msg.lower():
+                yield event.plain_result("❌ 生成被内容安全策略拦截（可能涉及敏感元素）")
+            else:
+                yield event.plain_result(f"❌ 手办化生成失败：{err_msg}")
+            return
+
+        if not results:
+            yield event.plain_result("❌ 未获取到有效图片")
+            return
+
+        url_or_none, img_bytes = results[0]
+
+        yield event.plain_result(style.success_text(is_random))
+
+        if img_bytes:
+            async for res in self._save_and_send_media(event, url_or_none or "hand_figure", img_bytes, "image"):
+                yield res
+        elif url_or_none and url_or_none.startswith("http"):
+            downloaded = await self._download_media(url_or_none)
+            if downloaded:
+                async for res in self._save_and_send_media(event, url_or_none, downloaded, "image"):
+                    yield res
+            else:
+                yield event.plain_result("❌ 图片下载失败，请查看日志")
+        else:
+            yield event.plain_result("❌ 处理结果异常，请查看日志")
+
+    @filter.command("grok变真人", alias={"Grok变真人", "grok 变真人"}, prefix_optional=True)
+    async def on_realistic_selfie(self, event: AstrMessageEvent):
+        raw_input = event.message_str.strip()
+        cmd = "grok变真人"
+        user_input = raw_input[len(cmd):].strip() if raw_input.lower().startswith(cmd) else raw_input
+
+        image_bytes = await self._get_image_from_event(event)
+        if not image_bytes:
+            yield event.plain_result("❌ 请附带一张清晰的参考图")
+            return
+
+        can_proceed, _ = await self._check_permissions(event)
+        if not can_proceed:
+            yield event.plain_result("❌ 当前会话无权限使用变真人功能")
+            return
+
+        allowed, msg = await self._check_rate_limit(event)
+        if not allowed:
+            yield event.plain_result(msg)
+            return
+
+        style_idx = None
+        if user_input and user_input.split()[0].isdigit():
+            try:
+                style_idx = int(user_input.split()[0])
+            except:
+                pass
+
+        style, is_random = REALISTIC_SELFIE_GROUP.select(style_idx)
+
+        yield event.plain_result(style.loading_text(is_random))
+
+        results, error = await self._generate_image(
+            prompt=style.prompt,
+            image_bytes=image_bytes,
+            n=1,
+            target_size="1024x1792",  # 或 "720x1280" 更像手機自拍
+        )
+
+        if error:
+            sender_id = str(event.get_sender_id())
+            if sender_id in self._last_usage:
+                self._last_usage[sender_id] = 10
+            yield event.plain_result(f"❌ 变真人生成失败：{self._translate_error(error)}")
+            return
+
+        if not results:
+            yield event.plain_result("❌ 未获取到有效图片")
+            return
+
+        url_or_none, img_bytes = results[0]
+
+        yield event.plain_result(style.success_text(is_random))
+
+        if img_bytes:
+            async for res in self._save_and_send_media(event, url_or_none or "realistic_selfie", img_bytes, "image"):
+                yield res
+        elif url_or_none and url_or_none.startswith("http"):
+            downloaded = await self._download_media(url_or_none)
+            if downloaded:
+                async for res in self._save_and_send_media(event, url_or_none, downloaded, "image"):
+                    yield res
+
+    @filter.command("grok变COS", alias={"Grok变COS", "grok 变COS", "Grok 变cos"}, prefix_optional=True)
+    async def on_cos(self, event: AstrMessageEvent):
+        raw_input = event.message_str.strip()
+        cmd = "grok变COS"
+        user_input = raw_input[len(cmd):].strip() if raw_input.lower().startswith(cmd.lower()) else raw_input
+
+        image_bytes = await self._get_image_from_event(event)
+        if not image_bytes:
+            yield event.plain_result("❌ 请附带一张清晰的参考图")
+            return
+
+        can_proceed, _ = await self._check_permissions(event)
+        if not can_proceed:
+            yield event.plain_result("❌ 当前会话无权限使用变COS功能")
+            return
+
+        allowed, msg = await self._check_rate_limit(event)
+        if not allowed:
+            yield event.plain_result(msg)
+            return
+
+        style_idx = None
+        if user_input and user_input.split()[0].isdigit():
+            try:
+                style_idx = int(user_input.split()[0])
+            except:
+                pass
+
+        style, is_random = COSPLAY_GROUP.select(style_idx)
+
+        yield event.plain_result(style.loading_text(is_random))
+
+        results, error = await self._generate_image(
+            prompt=style.prompt,
+            image_bytes=image_bytes,
+            n=1,
+            target_size="1024x1792",
+        )
+
+        if error:
+            sender_id = str(event.get_sender_id())
+            if sender_id in self._last_usage:
+                self._last_usage[sender_id] = 10
+            yield event.plain_result(f"❌ 变COS生成失败：{self._translate_error(error)}")
+            return
+
+        if not results:
+            yield event.plain_result("❌ 未获取到有效图片")
+            return
+
+        url_or_none, img_bytes = results[0]
+
+        yield event.plain_result(style.success_text(is_random))
+
+        if img_bytes:
+            async for res in self._save_and_send_media(event, url_or_none or "cosplay", img_bytes, "image"):
+                yield res
+        elif url_or_none and url_or_none.startswith("http"):
+            downloaded = await self._download_media(url_or_none)
+            if downloaded:
+                async for res in self._save_and_send_media(event, url_or_none, downloaded, "image"):
+                    yield res
+
+    @filter.command("grok氛围感", alias={"Grok氛围感", "grok 氛围感", "Grok 氛围感"}, prefix_optional=True)
+    async def on_atmosphere(self, event: AstrMessageEvent):
+        raw_input = event.message_str.strip()
+        cmd = "grok氛围感"
+        user_input = raw_input[len(cmd):].strip() if raw_input.startswith(cmd) else raw_input
+
+        image_bytes = await self._get_image_from_event(event)
+        if not image_bytes:
+            yield event.plain_result("❌ 请附带一张清晰的参考图")
+            return
+
+        can_proceed, _ = await self._check_permissions(event)
+        if not can_proceed:
+            yield event.plain_result("❌ 当前会话无权限使用氛围感功能")
+            return
+
+        allowed, msg = await self._check_rate_limit(event)
+        if not allowed:
+            yield event.plain_result(msg)
+            return
+
+        style_idx = None
+        if user_input and user_input.split()[0].isdigit():
+            try:
+                style_idx = int(user_input.split()[0])
+            except:
+                pass
+
+        style, is_random = ATMOSPHERE_GROUP.select(style_idx)
+
+        yield event.plain_result(style.loading_text(is_random))
+
+        results, error = await self._generate_image(
+            prompt=style.prompt,
+            image_bytes=image_bytes,
+            n=1,
+            target_size="1024x1792",
+        )
+
+        if error:
+            sender_id = str(event.get_sender_id())
+            if sender_id in self._last_usage:
+                self._last_usage[sender_id] = 10
+            yield event.plain_result(f"❌ 氛围感生成失败：{self._translate_error(error)}")
+            return
+
+        if not results:
+            yield event.plain_result("❌ 未获取到有效图片")
+            return
+
+        url_or_none, img_bytes = results[0]
+
+        yield event.plain_result(style.success_text(is_random))
+
+        if img_bytes:
+            async for res in self._save_and_send_media(event, url_or_none or "atmosphere", img_bytes, "image"):
+                yield res
+        elif url_or_none and url_or_none.startswith("http"):
+            downloaded = await self._download_media(url_or_none)
+            if downloaded:
+                async for res in self._save_and_send_media(event, url_or_none, downloaded, "image"):
+                    yield res
+        
+@filter.command("grok解图", alias={"Grok解图", "grok 解图", "Grok 解图"}, prefix_optional=True)
+async def on_concept_breakdown(self, event: AstrMessageEvent):
+    """Grok 解图（角色概念拆解）"""
+    image_bytes = await self._get_image_from_event(event)
+    if not image_bytes:
+        yield event.plain_result("❌ 请附带一张清晰的参考图")
+        return
+
+    can_proceed, _ = await self._check_permissions(event)
+    if not can_proceed:
+        yield event.plain_result("❌ 当前会话无权限使用解图功能")
+        return
+
+    allowed, msg = await self._check_rate_limit(event)
+    if not allowed:
+        yield event.plain_result(msg)
+        return
+
+    yield event.plain_result("📐 正在生成角色概念拆解图（9:16）...")
+
+    results, error = await self._generate_image(
+        prompt=CONCEPT_BREAKDOWN_PROMPT,
+        image_bytes=image_bytes,
+        n=1,
+        target_size="1024x1792",
+    )
+
+    if error:
+        yield event.plain_result(f"❌ 解图生成失败：{self._translate_error(error)}")
+        return
+
+    if not results:
+        yield event.plain_result("❌ 未获取到有效图片")
+        return
+
+    url_or_none, img_bytes = results[0]
+
+    yield event.plain_result("📐 概念拆解图 已完成")
+
+    if img_bytes:
+        async for res in self._save_and_send_media(event, url_or_none or "concept_breakdown", img_bytes, "image"):
+            yield res
+    elif url_or_none and url_or_none.startswith("http"):
+        downloaded = await self._download_media(url_or_none)
+        if downloaded:
+            async for res in self._save_and_send_media(event, url_or_none, downloaded, "image"):
+                yield res
+
+@filter.command("grok九宫图", alias={"Grok九宫图", "grok 九宫图", "Grok 九宫图"}, prefix_optional=True)
+async def on_nine_grid(self, event: AstrMessageEvent):
+    """Grok 九宫格表情漫画"""
+    image_bytes = await self._get_image_from_event(event)
+    if not image_bytes:
+        yield event.plain_result("❌ 请附带一张清晰的参考图")
+        return
+
+    can_proceed, _ = await self._check_permissions(event)
+    if not can_proceed:
+        yield event.plain_result("❌ 当前会话无权限使用九宫图功能")
+        return
+
+    allowed, msg = await self._check_rate_limit(event)
+    if not allowed:
+        yield event.plain_result(msg)
+        return
+
+    yield event.plain_result("🖼️ 正在生成九宫格表情特写漫画...")
+
+    results, error = await self._generate_image(
+        prompt=NINE_GRID_PROMPT,
+        image_bytes=image_bytes,
+        n=1,
+        target_size=None,  # 九宫格通常由模型自己決定比例
+    )
+
+    if error:
+        yield event.plain_result(f"❌ 九宫图生成失败：{self._translate_error(error)}")
+        return
+
+    if not results:
+        yield event.plain_result("❌ 未获取到有效图片")
+        return
+
+    url_or_none, img_bytes = results[0]
+
+    yield event.plain_result("🖼️ 九宫格表情特写漫画 已完成")
+
+    if img_bytes:
+        async for res in self._save_and_send_media(event, url_or_none or "nine_grid", img_bytes, "image"):
+            yield res
+    elif url_or_none and url_or_none.startswith("http"):
+        downloaded = await self._download_media(url_or_none)
+        if downloaded:
+            async for res in self._save_and_send_media(event, url_or_none, downloaded, "image"):
+                yield res
+
+    @filter.command("grok帮助", alias={"Grok帮助", "grok 帮助", "Grok 帮助"}, prefix_optional=True)
     async def on_help(self, event: AstrMessageEvent):
         help_text = (
             "【Grok AI 助手】\n\n"
@@ -2440,6 +2913,51 @@ class GrokPlugin(Star):
             "• /grok生图 一只猫\n"
             "• /grok生图 4 1792x1024 日落海滩\n"
             "• /grok生图 把背景换成森林 +图片\n\n"
+            "━━━━━━━━━━━━━━\n"
+            "🗿 手办化系列:\n"
+            "  /grok手办化 +图片\n"
+            "  /grok手办化 [1~3] +图片\n"
+            "    → 当前支持 3 种手办风格，不填编号随机\n"
+            "    1. 经典万代/好微笑 1/7 手办 + ZBrush + 电脑桌场景\n"
+            "    2. 潮流科幻未来展示柜 + 粒子特效\n"
+            "    3. 晶莹剔透底座 + Blender建模中场景\n"
+            "    4. PVC手办 + 半透明包装盒\n"
+            "      • 不填编号 → 随机一种\n"
+            "📱 变真人（自拍感）:\n"
+            "  /grok变真人 +图片\n"
+            "  /grok变真人 [1~4] +图片     ← 指定风格编号（可选）\n"
+            "    → 把动漫/二次元角色转成看起来像真人的随手自拍\n"
+            "    支持4种风格（不填编号随机）：\n"
+            "    1. 室内自然光随拍\n"
+            "    2. 户外阳光随意自拍\n"
+            "    3. 夜晚暖光室内自拍\n"
+            "    4. 极致无意识快照（最不摆拍）\n"
+            "📸 变COS:\n"
+            "  /grok变COS +图片\n"
+            "  /grok变COS [1~5] +图片     ← 指定风格编号（可选）\n"
+            "    → 把角色/人物转成真实 coser 照片，支持 5 种风格（不填编号随机）：\n"
+            "    1. 专业工作室干净白底（最常用）\n"
+            "    2. 漫展现场抓拍（人多背景热闹）\n"
+            "    3. 日系时尚杂志柔光美拍\n"
+            "    4. 赛博朋克霓虹雨夜街头\n"
+            "    5. 漫展自信叉腰摆 pose（上半身特写感强）\n"
+            "📐 解图（概念拆解）:\n"
+            "  /grok解图 +图片\n"
+            "    → 9:16全景角色概念拆解图\n"
+            "      • 中心完整全身立绘 + 周边结构分解\n"
+            "      • 包含服装分层、4种表情特写、核心道具、材质细节、生活小物\n\n"
+            "🥰 氛围感:\n"
+            "  /grok氛围感 +图片\n"
+            "  /grok氛围感 [1~7] +图片    ← 指定风格编号\n"
+            "      支持7种预设风格（9:16竖图）\n"
+            "      1. 暗黑孤独 + 白烟 + 红色发光\n"
+            "      2. 蓝调仰视背影 + 浓雾 + 手中玫瑰\n"
+            "      3. 双重曝光 + 黄昏山巅 + 温暖梦幻\n"
+            "      4. 故障艺术 + 赛博梦核 + 粒子交互\n"
+            "      5. 樱花剪影 + 落英 + 浪漫忧郁\n"
+            "      6. 雨夜霓虹都市 + 湿身反光 + 赛博孤独\n"
+            "      7. 极光雪林 + 梦幻光柱 + 静谧奇幻\n"
+            "      • 不填编号 → 随机一种\n"
             "━━━━━━━━━━━━━━\n"
             "🎬 视频命令:\n"
             "/grok视频 [尺寸] [时长] 提示词 [+图片可选]\n"
@@ -2479,6 +2997,11 @@ class GrokPlugin(Star):
             yield event.plain_result("❌ 当前会话无权限使用此功能")
             return
 
+        allowed, msg = await self._check_rate_limit(event)
+        if not allowed:
+            yield event.plain_result(msg)
+            return
+        
         cmd = "grok"
         query = normalized_input[len(cmd):].strip() if normalized_input.startswith(cmd) else normalized_input
 
@@ -2521,10 +3044,14 @@ class GrokPlugin(Star):
         query = (query or "").strip()
         if not query:
             return "搜索失败: 查询不能为空"
-
+        
         can_proceed, _ = await self._check_permissions(event)
         if not can_proceed:
             return "搜索失败: 当前会话没有权限使用该工具"
+
+        allowed, msg = await self._check_rate_limit(event)
+        if not allowed:
+            return msg
 
         result = await self._perform_web_search(query)
         return self._format_search_result_for_llm(result)

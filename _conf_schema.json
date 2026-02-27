@@ -122,5 +122,58 @@
         "type": "list",
         "items": {"type": "string"},
         "default": []
+    },
+    "is_sensitive": {
+        "description": "敏感词开关",
+        "hint": "开启后生图进行敏感词过滤",
+        "type": "bool",
+        "default": true
+    },
+    "sensitive_whitelist": {
+        "description": "敏感词用户白名单",
+        "hint": "允许使用敏感词的用户ID列表，为空则不限制",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": []
+    },
+    "sensitive_keywords": {
+        "description": "生图提示词敏感词过滤列表（用于风控）",
+        "hint": "数组形式，每项为一个关键词（大小写不敏感，建议全小写）。支持简单字符串匹配。",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": [
+            "nude", "naked", "nudes", "nudity", "topless", "bottomless",
+            "nsfw", "porn", "porno", "pornographic", "sex", "sexual", "erotic", "erotica",
+            "explicit", "xxx", "adult", "18+", "hentai",
+            "cum", "cumshot", "orgasm", "blowjob", "handjob", "fuck", "fucking",
+            "sextoy", "dildo", "vibrator",
+            "bdsm", "bondage", "slave", "mistress", "master",
+            "rape", "forced", "nonconsensual",
+            "incest", "loli", "shota", "underage", "child", "young girl", "young boy",
+            "teen", "lolita", "pedo", "pedophile",
+            "gore", "blood", "violence", "torture", "kill", "murder", "suicide",
+            "behead", "decapitate",
+            "genital", "penis", "vagina", "pussy", "dick", "cock", "ass", "butthole", "anus",
+            "breasts", "boobs", "tits", "nipple", "areola",
+            "pubic", "bush", "shaved", "cameltoe",
+            "upskirt", "downblouse", "panties", "lingerie", "bikini", "thong",
+            "see through", "transparent", "wet", "sweaty",
+            "aroused", "horny", "masturbate", "masturbation", "fingering",
+            "anal", "double penetration", "gangbang", "threesome", "orgy",
+            "creampie", "facial", "bukkake", "deepthroat"
+        ]
+    },
+    "rate_limit_seconds": {
+        "description": "速率限制 - 每 X 秒只能使用一次命令",
+        "hint": "设为 0 或负数 = 关闭速率限制；建议 30~120 秒",
+        "type": "int",
+        "default": 60
+    },
+    "rate_limit_whitelist": {
+        "description": "速率限制白名单用户",
+        "hint": "这些用户ID不受 X 秒一次的限制（数组）",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": []
     }
 }
