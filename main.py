@@ -44,8 +44,8 @@ except ImportError:
 class GrokPlugin(Star):
     """Grok 多媒体与联网搜索插件 - 支持生图、生视频、联网搜索"""
 
-    DEFAULT_TEXT_IMAGE_SIZE = "1024x1792"
-    DEFAULT_VIDEO_SIZE = "1280x720"
+    DEFAULT_TEXT_IMAGE_SIZE = "720x1280"  # 9:16 竖屏
+    DEFAULT_VIDEO_SIZE = "1792x1024"      # 3:2 横构图
     DEFAULT_VIDEO_LENGTH_SECONDS = 6
     SUPPORTED_VIDEO_LENGTH_SECONDS = (6, 10, 15)
     VIDEO_RESOLUTION_NAME = "720p"
@@ -56,6 +56,21 @@ class GrokPlugin(Star):
         "1792x1024",
         "720x1280",
     )
+    SIZE_TO_ASPECT_RATIO = {
+        "1280x720": "16:9",
+        "720x1280": "9:16",
+        "1792x1024": "3:2",
+        "1024x1792": "2:3",
+        "1024x1024": "1:1",
+    }
+    # 反向映射：比例 → 像素尺寸（用于用户输入比例格式时的转换）
+    ASPECT_RATIO_TO_SIZE = {
+        "16:9": "1280x720",
+        "9:16": "720x1280",
+        "3:2": "1792x1024",
+        "2:3": "1024x1792",
+        "1:1": "1024x1024",
+    }
     DEFAULT_SEARCH_MODEL = "grok-4-fast"
     DEFAULT_SEARCH_TIMEOUT = 60.0
     DEFAULT_SEARCH_THINKING_BUDGET = 32000
@@ -481,7 +496,25 @@ class GrokPlugin(Star):
         return f"{width}x{height}"
 
     def _normalize_supported_size(self, size: str) -> Optional[str]:
-        """归一化并校验是否为受支持尺寸"""
+        """归一化并校验是否为受支持尺寸
+
+        支持两种输入格式：
+        1. 像素格式：如 "1280x720"
+        2. 比例格式：如 "16:9"
+
+        Returns:
+            标准化的像素格式字符串，如 "1280x720"；无效输入返回 None
+        """
+        # 先尝试比例格式（如 "16:9"）
+        if ":" in size:
+            parts = size.split(":")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                # 有效的比例格式，查找对应的像素尺寸
+                if size in self.ASPECT_RATIO_TO_SIZE:
+                    return self.ASPECT_RATIO_TO_SIZE[size]
+                return None
+
+        # 尝试像素格式（如 "1280x720"）
         parsed = self._parse_size_string(size)
         if not parsed:
             return None
@@ -529,10 +562,49 @@ class GrokPlugin(Star):
             )
             ratio_distance = abs((cand_w / cand_h) - target_ratio)
             area_distance = abs((cand_w * cand_h) - target_area) / max(target_area, 1)
-            return dim_distance, ratio_distance, area_distance
+            # 比例优先：先保证构图比例，再考虑像素接近度
+            return ratio_distance, area_distance, dim_distance
 
         best = min(candidates, key=distance)
         return best[0]
+
+    @classmethod
+    def _size_to_aspect_ratio(cls, size: str) -> str:
+        """将像素尺寸转换为宽高比
+
+        Args:
+            size: 像素尺寸字符串（如 "1280x720"）或比例字符串（如 "16:9"）
+
+        Returns:
+            宽高比字符串，如 "16:9"
+        """
+        # 白名单：Grok 支持的标准比例
+        ALLOWED_RATIOS = {"1:1", "2:3", "3:2", "9:16", "16:9"}
+
+        if size in cls.SIZE_TO_ASPECT_RATIO:
+            return cls.SIZE_TO_ASPECT_RATIO[size]
+        if ":" in size:
+            parts = size.split(":")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                # 只接受白名单中的比例
+                if size in ALLOWED_RATIOS:
+                    return size
+        # 回退值与 grok2api 保持一致
+        return "2:3"
+
+    @classmethod
+    def _get_aspect_ratio_display(cls, size: str) -> str:
+        """获取尺寸的比例显示（用于用户提示）
+
+        Args:
+            size: 像素尺寸字符串（如 "1280x720"）
+
+        Returns:
+            比例字符串，如 "16:9"，如果无法识别则返回原始尺寸
+        """
+        if size in cls.SIZE_TO_ASPECT_RATIO:
+            return cls.SIZE_TO_ASPECT_RATIO[size]
+        return size
 
     def _build_video_prompt(self, prompt: str, has_reference_image: bool) -> str:
         """构建视频增强提示词，默认开启细节与稳定性增强"""
@@ -981,13 +1053,13 @@ class GrokPlugin(Star):
         # 优先尝试增强参数；若后端不支持 preset，再自动降级到基础参数
         video_config_candidates: List[Dict[str, Any]] = [
             {
-                "size": target_size,
+                "aspect_ratio": self._size_to_aspect_ratio(target_size),
                 "resolution_name": self.VIDEO_RESOLUTION_NAME,
                 "video_length": video_length,
                 "preset": "custom",
             },
             {
-                "size": target_size,
+                "aspect_ratio": self._size_to_aspect_ratio(target_size),
                 "resolution_name": self.VIDEO_RESOLUTION_NAME,
                 "video_length": video_length,
             },
@@ -2302,9 +2374,9 @@ class GrokPlugin(Star):
         invalid_size = params.get("invalid_size")
 
         if not image_bytes and invalid_size:
-            supported_sizes = "、".join(self.SUPPORTED_IMAGE_SIZES)
+            supported_ratios = "、".join(self.SIZE_TO_ASPECT_RATIO.values())
             yield event.plain_result(
-                f"❌ 不支持的尺寸: {invalid_size}\n支持尺寸: {supported_sizes}"
+                f"❌ 不支持的尺寸: {invalid_size}\n支持比例: {supported_ratios}"
             )
             return
 
@@ -2320,7 +2392,8 @@ class GrokPlugin(Star):
         if not target_size:
             target_size = self.DEFAULT_TEXT_IMAGE_SIZE
 
-        yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {target_size} ...")
+        aspect_ratio_display = self._get_aspect_ratio_display(target_size)
+        yield event.plain_result(f"🎨 正在进行 [{mode}] · {n}张 · {aspect_ratio_display} ...")
 
         if prompt_text:
             translate_prompt = (
@@ -2454,9 +2527,9 @@ class GrokPlugin(Star):
         prompt_text, params = self._parse_video_params(user_input, strict_size=not image_bytes)
 
         if not image_bytes and params.get("invalid_size"):
-            supported_sizes = "、".join(self.SUPPORTED_IMAGE_SIZES)
+            supported_ratios = "、".join(self.SIZE_TO_ASPECT_RATIO.values())
             yield event.plain_result(
-                f"❌ 不支持的尺寸: {params['invalid_size']}\n支持尺寸: {supported_sizes}"
+                f"❌ 不支持的尺寸: {params['invalid_size']}\n支持比例: {supported_ratios}"
             )
             return
 
@@ -2479,8 +2552,9 @@ class GrokPlugin(Star):
 
         video_target_size = target_size or self.DEFAULT_VIDEO_SIZE
 
+        aspect_ratio_display = self._get_aspect_ratio_display(video_target_size)
         yield event.plain_result(
-            f"🎬 正在进行 [{mode}] · {video_length_seconds}秒 · {target_size} ..."
+            f"🎬 正在进行 [{mode}] · {video_length_seconds}秒 · {aspect_ratio_display} ..."
         )
 
         video_result, error = await self._generate_video(
@@ -2904,14 +2978,15 @@ async def on_nine_grid(self, event: AstrMessageEvent):
         help_text = (
             "【Grok AI 助手】\n\n"
             "🎨 生图命令:\n"
-            "/grok生图 [数量] [尺寸] 提示词\n"
+            "/grok生图 [数量] [比例] 提示词\n"
             "• 数量: 1-10 (默认1)\n"
-            "• 尺寸: 1024x1024 / 1024x1792 / 1280x720 / 1792x1024 / 720x1280\n"
-            "• 不传尺寸时默认 1024x1792\n"
-            "• 可附带图片进行图生图；附带两张图时第2张作为局部重绘蒙版\n\n"
+            "• 比例: 1:1 / 2:3 / 3:2 / 9:16 / 16:9\n"
+            "• 不传比例时默认 9:16 竖屏\n"
+            "• 可附带图片进行图生图，自动匹配原图比例\n"
+            "• 附带两张图时第2张作为局部重绘蒙版\n\n"
             "示例:\n"
             "• /grok生图 一只猫\n"
-            "• /grok生图 4 1792x1024 日落海滩\n"
+            "• /grok生图 4 3:2 日落海滩\n"
             "• /grok生图 把背景换成森林 +图片\n\n"
             "━━━━━━━━━━━━━━\n"
             "🗿 手办化系列:\n"
@@ -2960,16 +3035,17 @@ async def on_nine_grid(self, event: AstrMessageEvent):
             "      • 不填编号 → 随机一种\n"
             "━━━━━━━━━━━━━━\n"
             "🎬 视频命令:\n"
-            "/grok视频 [尺寸] [时长] 提示词 [+图片可选]\n"
-            "• 文生视频默认尺寸 1280x720\n"
+            "/grok视频 [比例] [时长] 提示词 [+图片可选]\n"
+            "• 比例: 1:1 / 2:3 / 3:2 / 9:16 / 16:9\n"
+            "• 不传比例时默认 3:2 横构图\n"
             "• 时长支持 6/10/15 秒，默认 6 秒\n"
-            "• 图生视频自动读取原图分辨率并匹配最近合法尺寸\n"
+            "• 图生视频自动匹配原图比例\n"
             "• 固定 720p 输出，并自动启用增强策略\n\n"
             "示例:\n"
             "• /grok视频 让画面动起来\n"
             "• /grok视频 10 夜晚海边慢镜头\n"
-            "• /grok视频 1280x720 让城市霓虹缓慢流动\n"
-            "• /grok视频 让人物眨眼微笑\n\n"
+            "• /grok视频 16:9 让城市霓虹缓慢流动\n"
+            "• /grok视频 让人物眨眼微笑 +图片\n\n"
             "━━━━━━━━━━━━━━\n"
             "💬 对话命令:\n"
             "/grok <内容> [+图片/语音/文件可选]\n"
